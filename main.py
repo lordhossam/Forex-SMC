@@ -7,8 +7,6 @@ import yfinance as yf
 import requests
 import pytz
 from datetime import datetime
-import mplfinance as mpf
-import matplotlib.pyplot as plt
 
 # ====================== Configuration ======================
 TOKEN = os.getenv("TOKEN")
@@ -18,11 +16,6 @@ if not TOKEN or not CHAT_ID:
     sys.exit(1)
 
 PAIRS = ["GC=F", "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "NZDUSD=X"]
-TIMEFRAMES = {
-    "1d": "10d",
-    "1h": "10d",
-    "15m": "5d"
-}
 KILLZONES = {
     "Asian": (20, 22),      # 8-10 PM EST
     "London": (2, 5),       # 2-5 AM EST
@@ -48,12 +41,16 @@ class DataFetcher:
     def get_data(self, symbol, interval, period):
         """Return DataFrame for given symbol, interval, period."""
         key = f"{symbol}_{interval}_{period}"
+        # Check cache
         if key in self.cache:
             df = self.cache[key]
-            # Invalidate if too old (e.g., > 1 minute for 15m data)
-            if (datetime.now() - df.index[-1].to_pydatetime()).seconds < 120:
+            if not df.empty and (datetime.now() - df.index[-1].to_pydatetime()).seconds < 120:
                 return df
-        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+        try:
+            df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+        except Exception as e:
+            logging.error(f"yfinance error for {symbol} {interval}: {e}")
+            return pd.DataFrame()
         if df.empty:
             logging.warning(f"No data for {symbol} {interval}")
             return pd.DataFrame()
@@ -105,90 +102,12 @@ class ICTIndicators:
         }
 
     @staticmethod
-    def detect_order_blocks(df, lookback=20):
-        """Find bullish and bearish order blocks."""
-        if len(df) < lookback:
-            return [], []
-        bullish_obs = []
-        bearish_obs = []
-        # Find displacement candles
-        for i in range(2, len(df)-1):
-            # Check if current candle is a displacement
-            body = abs(df['Close'].iloc[i] - df['Open'].iloc[i])
-            rng = df['High'].iloc[i] - df['Low'].iloc[i]
-            if rng == 0:
-                continue
-            body_pct = body / rng
-            if body_pct < 0.65:
-                continue
-            # If bullish displacement (close > open), previous candle (if bearish) is a bullish OB
-            if df['Close'].iloc[i] > df['Open'].iloc[i]:
-                prev = df.iloc[i-1]
-                if prev['Close'] < prev['Open']:
-                    bullish_obs.append({
-                        'high': prev['High'],
-                        'low': prev['Low'],
-                        'time': prev.name
-                    })
-            # If bearish displacement, previous candle (if bullish) is a bearish OB
-            elif df['Close'].iloc[i] < df['Open'].iloc[i]:
-                prev = df.iloc[i-1]
-                if prev['Close'] > prev['Open']:
-                    bearish_obs.append({
-                        'high': prev['High'],
-                        'low': prev['Low'],
-                        'time': prev.name
-                    })
-        return bullish_obs, bearish_obs
-
-    @staticmethod
-    def detect_breaker_blocks(df, lookback=30):
-        """Find breaker blocks: failed OBs that later cause reversal."""
-        # Simple: look for a candle that breaks a previous OB and later price returns to it
-        # For now return empty; can be expanded later
-        return [], []
-
-    @staticmethod
-    def detect_liquidity_sweep(df, prev_high, prev_low):
-        """Check if price swept recent highs/lows."""
-        current_high = df['High'].iloc[-1]
-        current_low = df['Low'].iloc[-1]
-        sweep_high = current_high > prev_high
-        sweep_low = current_low < prev_low
-        return sweep_high, sweep_low
-
-    @staticmethod
     def equilibrium(df, window=20):
         """Calculate equilibrium as mid of recent range."""
         return (df['High'].tail(window).max() + df['Low'].tail(window).min()) / 2
 
-    @staticmethod
-    def premium_discount(current_price, equilibrium):
-        """Return 'premium' if price above equilibrium else 'discount'."""
-        return 'premium' if current_price > equilibrium else 'discount'
-
-    @staticmethod
-    def ote(df, direction='bullish', fib_levels=(0.62, 0.79)):
-        """Return OTE zone based on Fibonacci retracement of recent swing."""
-        if len(df) < 10:
-            return None
-        if direction == 'bullish':
-            # Find the last significant swing low and high
-            low = df['Low'].min()
-            high = df['High'].max()
-            diff = high - low
-            entry_low = high - diff * fib_levels[1]
-            entry_high = high - diff * fib_levels[0]
-        else:
-            low = df['Low'].min()
-            high = df['High'].max()
-            diff = high - low
-            entry_low = low + diff * fib_levels[0]
-            entry_high = low + diff * fib_levels[1]
-        return (entry_low, entry_high)
-
 class TelegramSender:
-    """Send messages and charts via Telegram."""
+    """Send messages via Telegram (text only)."""
     def __init__(self, token, chat_id):
         self.token = token
         self.chat_id = chat_id
@@ -199,20 +118,6 @@ class TelegramSender:
             requests.post(url, json={"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
         except Exception as e:
             logging.error(f"Telegram send error: {e}")
-
-    def send_chart(self, df, symbol, caption):
-        try:
-            mpf.plot(df.tail(60), type='candle', style='charles', title=f"{symbol} - ICT Pro Signal",
-                     figsize=(16,9), savefig='signal.png')
-            with open('signal.png', 'rb') as f:
-                files = {'photo': f}
-                data = {'chat_id': self.chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
-                url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
-                requests.post(url, data=data, files=files, timeout=10)
-            os.remove('signal.png')
-        except Exception as e:
-            logging.error(f"Chart send error: {e}")
-            self.send_text(caption)  # fallback to text
 
 class ICTBot:
     def __init__(self):
@@ -263,15 +168,12 @@ class ICTBot:
             displacement = self.indicators.detect_displacement(df_15m)
             equilibrium = self.indicators.equilibrium(df_15m)
             current_price = df_15m['Close'].iloc[-1]
-            pd = self.indicators.premium_discount(current_price, equilibrium)
             killzone = self.is_killzone()
             bias = self.get_bias(df_1h)
 
-            # OTE (for entry refinement)
-            ote_zone = self.indicators.ote(df_15m, 'bullish')  # will use direction later
-
             # Liquidity sweeps
-            sweep_high, sweep_low = self.indicators.detect_liquidity_sweep(df_15m, prev_high, prev_low)
+            sweep_high = df_15m['High'].iloc[-1] > prev_high
+            sweep_low = df_15m['Low'].iloc[-1] < prev_low
 
             # --- Buy conditions ---
             if (sweep_low and mss['bullish'] and displacement and
@@ -283,7 +185,7 @@ class ICTBot:
                 stop = df_15m['Low'].iloc[-1] - STOP_DISTANCE.get(symbol, STOP_DISTANCE['default'])
                 tp1 = equilibrium
                 tp2 = prev_high
-                rr = (tp2 - entry) / (entry - stop)
+                rr = (tp2 - entry) / (entry - stop) if (entry - stop) != 0 else 0
 
                 gold_tag = "🔥 GOLD SIGNAL" if symbol == "GC=F" else ""
                 msg = (f"🚀 *ICT PRO - BUY SIGNAL* {gold_tag}\n"
@@ -293,7 +195,7 @@ class ICTBot:
                        f"🛑 Stop: {stop:.5f}\n"
                        f"💰 TP1: {tp1:.5f} | TP2: {tp2:.5f}\n"
                        f"📊 RR: 1:{rr:.1f} | Killzone: ✅")
-                self.sender.send_chart(df_15m, symbol, msg)
+                self.sender.send_text(msg)
 
             # --- Sell conditions ---
             elif (sweep_high and mss['bearish'] and displacement and
@@ -304,7 +206,7 @@ class ICTBot:
                 stop = df_15m['High'].iloc[-1] + STOP_DISTANCE.get(symbol, STOP_DISTANCE['default'])
                 tp1 = equilibrium
                 tp2 = prev_low
-                rr = (entry - tp2) / (stop - entry)
+                rr = (entry - tp2) / (stop - entry) if (stop - entry) != 0 else 0
 
                 gold_tag = "🔥 GOLD SIGNAL" if symbol == "GC=F" else ""
                 msg = (f"📉 *ICT PRO - SELL SIGNAL* {gold_tag}\n"
@@ -314,25 +216,22 @@ class ICTBot:
                        f"🛑 Stop: {stop:.5f}\n"
                        f"💰 TP1: {tp1:.5f} | TP2: {tp2:.5f}\n"
                        f"📊 RR: 1:{rr:.1f} | Killzone: ✅")
-                self.sender.send_chart(df_15m, symbol, msg)
+                self.sender.send_text(msg)
 
         except Exception as e:
             logging.error(f"Error analyzing {symbol}: {e}")
 
     def run(self):
         """Main loop: analyze all pairs every 15 minutes."""
-        self.sender.send_text("✅ *ICT Pro Bot started on Railway*\n🔥 Gold + Forex 24/7")
+        self.sender.send_text("✅ *ICT Pro Bot started on Railway*\n🔥 Gold + Forex 24/7 (Text only mode)")
         while True:
             try:
                 for pair in PAIRS:
                     self.analyze_pair(pair)
                 time.sleep(SLEEP_INTERVAL)
-            except KeyboardInterrupt:
-                self.sender.send_text("🛑 Bot stopped by user.")
-                break
             except Exception as e:
                 logging.error(f"Main loop error: {e}")
-                time.sleep(60)
+                time.sleep(60)  # wait before retry
 
 # ====================== Start the Bot ======================
 if __name__ == "__main__":
